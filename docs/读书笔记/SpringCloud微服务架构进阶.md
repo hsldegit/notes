@@ -823,7 +823,687 @@ public Applications getApplicationDeltasFromMultipleRegions(String[] remoteRegio
 
 ## Spring cloud OpenFeign
 
+读者在阅读OpenFeign源码时，可以沿着两条路线进行，一是FeignServiceClient这样的被@FeignClient注解修饰的接口类(后续简称为FeignClient接口类)如何创建，也就是其Bean实例是如何被创建的；二是调用FeignServiceClient对象的网络请求相关的函数时，OpenFeign是如何发送网络请求的。而OpenFeign相关的类也可以以此来进行分类，一部分是用来初始化相应的Bean实例的，一部分是用来在调用方法时发送网络请求。
+
+```java
+@SpringBootApplication
+@EnableFeignClients
+public class FeignClientApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ChapterFeignClientApplication.class, args);
+    }
+}
+```
+
+@EnableFeignClients就像是一个开关，只有使用了该注解，OpenFeign相关的组件和配置机制才会生效。@EnableFeignClients还可以对OpenFeign相关组件进行自定义配置，
+
+```java
+@FeignClient("feign-service")
+@RequestMapping("/feign-service")
+public interface FeignServiceClient {
+    @RequestMapping(value = "/instance/{serviceId}", method = RequestMethod.GET)
+    public Instance getInstanceByServiceId(@PathVariable("serviceId") String serviceId);
+}
+```
+
+### FeignClientsRegistrar
+
+```java
+//EnableFeignClients.java
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.TYPE)
+@Documented
+//ImportBeanDefinitionRegistrar的子类,用于处理@FeignClient注解
+@Import(FeignClientsRegistrar.class)
+public @interface EnableFeignClients {
+    // 下面三个函数都是为了指定需要扫描的包
+    String[] value() default {};
+    String[] basePackages() default {};
+    Class〈?〉[] basePackageClasses() default {};
+    // 指定自定义feign client的自定义配置，可以配置Decoder、Encoder和Contract等组件,
+    FeignClientsConfiguration是默认的配置类
+    Class〈?〉[] defaultConfiguration() default {};
+    // 指定被@FeignClient修饰的类，如果不为空，那么路径自动检测机制会被关闭
+    Class〈?〉[] clients() default {};
+}
+```
+
+上面的代码中，FeignClientsRegistrar是ImportBeanDefinitionRegistrar的子类，Spring用ImportBeanDefinitionRegistrar来动态注册BeanDefinition。OpenFeign通过FeignClientsRegistrar来处理@FeignClient修饰的FeignClient接口类，将这些接口类的BeanDefinition注册到Spring容器中，这样就可以使用@Autowired等方式来自动装载这些FeignClient接口类的Bean实例。FeignClientsRegistrar的部分代码如下所示：
+
+```java
+//FeignClientsRegistrar.java
+class FeignClientsRegistrar implements ImportBeanDefinitionRegistrar,
+        ResourceLoaderAware, BeanClassLoaderAware, EnvironmentAware {
+    ...
+    @Override
+    public void registerBeanDefinitions(AnnotationMetadata metadata,
+        BeanDefinitionRegistry registry) {
+        //从EnableFeignClients的属性值来构建Feign的自定义Configuration进行注册
+        registerDefaultConfiguration(metadata, registry);
+        //扫描package，注册被@FeignClient修饰的接口类的Bean信息
+        registerFeignClients(metadata, registry);
+    }
+    ...
+}
+```
+
+如上述代码所示，FeignClientsRegistrar的registerBeanDefinitions方法主要做了两个事情:
+一是注册@EnableFeignClients提供的自定义配置类中的相关Bean实例
+二是根据@EnableFeignClients提供的包信息扫描@FeignClient注解修饰的FeignCleint接口类，然后进行Bean实例注册
+@EnableFeignClients的自定义配置类是被@Configuration注解修饰的配置类，它会提供一系列组装FeignClient的各类组件实例。这些组件包括：Client、Targeter、Decoder、Encoder和Contract等。接下来看看registerDefaultConfiguration的代码实现，如下所示：
+
+```java
+   //FeignClientsRegistrar.java
+private void registerDefaultConfiguration(AnnotationMetadata metadata,
+            BeanDefinitionRegistry registry) {
+    //获取到metadata中关于EnableFeignClients的属性值键值对
+    Map〈String, Object〉 defaultAttrs = metadata
+            .getAnnotationAttributes(EnableFeignClients.class.getName(), true);
+     // 如果EnableFeignClients配置了defaultConfiguration类，那么才进行下一步操作，如果没有，会使用默认的FeignConfiguration
+    if (defaultAttrs != null && defaultAttrs.containsKey("defaultConfiguration")) {
+        String name;
+        if (metadata.hasEnclosingClass()) {
+            name = "default." + metadata.getEnclosingClassName();
+        }
+        else {
+            name = "default." + metadata.getClassName();
+        }
+        registerClientConfiguration(registry, name,
+                defaultAttrs.get("defaultConfiguration"));
+    }
+  }
+```
+
+如上述代码所示，registerDefaultConfiguration方法会判断@EnableFeignClients注解是否设置了defaultConfiguration属性。如果有，则将调用registerClientConfiguration方法，进行BeanDefinitionRegistry的注册。registerClientConfiguration方法的代码如下所示。
+
+```java
+/ FeignClientsRegistrar.java
+private void registerClientConfiguration(BeanDefinitionRegistry registry, Object name,
+    Object configuration) {
+    // 使用BeanDefinitionBuilder来生成BeanDefinition，并注册到registry上
+    BeanDefinitionBuilder builder = BeanDefinitionBuilder
+        .genericBeanDefinition(FeignClientSpecification.class);
+    builder.addConstructorArgValue(name);
+    builder.addConstructorArgValue(configuration);
+    registry.registerBeanDefinition(
+        name + "." + FeignClientSpecification.class.getSimpleName(),
+        builder.getBeanDefinition());
+}
+```
+
+BeanDefinitionRegistry是Spring框架中用于动态注册BeanDefinition信息的接口，调用其registerBeanDefinition方法可以将BeanDefinition注册到Spring容器中，其中name属性就是注册BeanDefinition的名称。
+
+FeignClientSpecification类实现了NamedContextFactory.Specification接口，它是OpenFeign组件实例化的重要一环，它持有自定义配置类提供的组件实例，供OpenFeign使用。Spring Cloud框架使用NamedContextFactory创建一系列的运行上下文(ApplicationContext)，来让对应的Specification在这些上下文中创建实例对象。这样使得各个子上下文中的实例对象相互独立，互不影响，可以方便地通过子上下文管理一系列不同的实例对象。NamedContextFactory有三个功能，一是创建AnnotationConfigApplicationContext子上下文；二是在子上下文中创建并获取Bean实例；三是当子上下文消亡时清除其中的Bean实例。在OpenFeign中，FeignContext继承了NamedContextFactory，用于存储各类OpenFeign的组件实例。
+
+FeignAutoConfiguration是OpenFeign的自动配置类，它会提供FeignContext实例。并且将之前注册的FeignClientSpecification通过setConfigurations方法设置给FeignContext实例。这里处理了默认配置类FeignClientsConfiguration和自定义配置类的替换问题。果FeignClientsRegistrar没有注册自定义配置类，那么configurations将不包含FeignClientSpecification对象，否则会在setConfigurations方法中进行默认配置类的替换。
+
+```java
+//FeignAutoConfiguration.java
+@Autowired(required = false)
+private List〈FeignClientSpecification〉 configurations = new ArrayList〈〉();
+@Bean
+public FeignContext feignContext() {
+    FeignContext context = new FeignContext();
+    context.setConfigurations(this.configurations);
+    return context;
+}
+//FeignContext.java
+public class FeignContext extends NamedContextFactory〈FeignClientSpecification〉 {
+    public FeignContext() {
+        //将默认的FeignClientConfiguration作为参数传递给构造函数
+        super(FeignClientsConfiguration.class, "feign", "feign.client.name");
+    }
+}
+```
+
+.扫描类信息
+FeignClientsRegistrar做的第二件事情是扫描指定包下的类文件，注册@FeignClient注解修饰的接口类信息，如下所示：
+
+```java
+//FeignClientsRegistrar.java
+public void registerFeignClients(AnnotationMetadata metadata,
+        BeanDefinitionRegistry registry) {
+    //生成自定义的ClassPathScanningProvider
+    ClassPathScanningCandidateComponentProvider scanner = getScanner();
+    scanner.setResourceLoader(this.resourceLoader);
+    Set〈String〉 basePackages;
+    //获取EnableFeignClients所有属性的键值对
+    Map〈String, Object〉 attrs = metadata
+            .getAnnotationAttributes(EnableFeignClients.class.getName());
+    //依照Annotation来进行TypeFilter，只会扫描出被FeignClient修饰的类
+    AnnotationTypeFilter annotationTypeFilter = new AnnotationTypeFilter(
+            FeignClient.class);
+    final Class〈?〉[] clients = attrs == null ? null
+            : (Class〈?〉[]) attrs.get("clients");
+    //如果没有设置clients属性，那么需要扫描basePackage，所以设置了AnnotationTypeFilter,
+           并且去获取basePackage
+    if (clients == null || clients.length == 0) {
+        scanner.addIncludeFilter(annotationTypeFilter);
+        basePackages = getBasePackages(metadata);
+    }
+    //代码有删减，遍历上述过程中获取的basePackages列表
+    for (String basePackage : basePackages) {
+        //获取basepackage下的所有BeanDefinition
+        Set〈BeanDefinition〉 candidateComponents = scanner
+                .findCandidateComponents(basePackage);
+        for (BeanDefinition candidateComponent : candidateComponents) {
+            if (candidateComponent instanceof AnnotatedBeanDefinition) {
+                AnnotatedBeanDefinition beanDefinition = (AnnotatedBeanDefinition) candidateComponent;
+                AnnotationMetadata annotationMetadata = beanDefinition.getMetadata();
+                //从这些BeanDefinition中获取FeignClient的属性值
+                Map〈String, Object〉 attributes = annotationMetadata
+                        .getAnnotationAttributes(
+                                FeignClient.class.getCanonicalName());
+                String name = getClientName(attributes);
+                //对单独某个FeignClient的configuration进行配置
+                registerClientConfiguration(registry, name,
+                        attributes.get("configuration"));
+                //注册FeignClient的BeanDefinition
+                registerFeignClient(registry, annotationMetadata, attributes);
+            }
+        }
+    }
+}
+```
+
+如上述代码所示，FeignClientsRegistrar的registerFeignClients方法依据@EnableFeignClients的属性获取要扫描的包路径信息，然后获取这些包下所有被@FeignClient注解修饰的接口类的BeanDefinition，最后调用registerFeignClient动态注册BeanDefinition。registerFeignClients方法中有一些细节值得认真学习，有利于加深了解Spring框架。首先是如何自定义Spring类扫描器，即如何使用ClassPathScanningCandidateComponentProvider和各类TypeFilter。
+OpenFeign使用了AnnotationTypeFilter，来过滤出被@FeignClient修饰的类，getScanner方法的具体实现如下所示：
+
+```java
+//FeignClientsRegistrar.java
+protected ClassPathScanningCandidateComponentProvider getScanner() {
+    return new ClassPathScanningCandidateComponentProvider(false, this.environment) {
+        @Override
+        protected boolean isCandidateComponent(AnnotatedBeanDefinition beanDefinition) {
+            boolean isCandidate = false;
+            //判断beanDefinition是否为内部类，否则直接返回false
+            if (beanDefinition.getMetadata().isIndependent()) {
+                //判断是否为接口类，所实现的接口只有一个，并且该接口是Annotation。否则直接
+                       返回true
+                if (!beanDefinition.getMetadata().isAnnotation()) {
+                    isCandidate = true;
+                }
+            }
+            return isCandidate;
+        }
+    };
+}
+```
+
+ClassPathScanningCandidateComponentProvider的作用是遍历指定路径的包下的所有类。比如指定包路径为com/test/openfeign，它会找出com.test.openfeign包下所有的类，将所有的类封装成Resource接口集合。Resource接口是Spring对资源的封装，有FileSystemResource、ClassPathResource、UrlResource等多种实现。接着ClassPathScanningCandidateComponentProvider类会遍历Resource集合，通过includeFilters和excludeFilters两种过滤器进行过滤操作。includeFilters和excludeFilters是TypeFilter接口类型实例的集合，TypeFilter接口是一个用于判断类型是否满足要求的类型过滤器。excludeFilters中只要有一个TypeFilter满足条件，这个Resource就会被过滤掉；而includeFilters中只要有一个TypeFilter满足条件，这个Resource就不会被过滤。如果一个Resource没有被过滤，它会被转换成ScannedGenericBeanDefinition添加到BeanDefinition集合中。
+
+FeignClientFactoryBean是工厂类，Spring容器通过调用它的getObject方法来获取对应的Bean实例。被@FeignClient修饰的接口类都是通过FeignClientFactoryBean的getObject方法来进行实例化的，具体实现如下代码所示：
+
+```java
+FeignClientFactoryBean是工厂类，Spring容器通过调用它的getObject方法来获取对应的Bean实例。被@FeignClient修饰的接口类都是通过FeignClientFactoryBean的getObject方法来进行实例化的，具体实现如下代码所示：
+//FeignClientFactoryBean.java
+public Object getObject() throws Exception {
+    FeignContext context = applicationContext.getBean(FeignContext.class);
+    Feign.Builder builder = feign(context);
+    if (StringUtils.hasText(this.url) &amp;&amp; !this.url.startsWith("http")) {
+        this.url = "http://" + this.url;
+    }
+    String url = this.url + cleanPath();
+    //调用FeignContext的getInstance方法获取Client对象
+    Client client = getOptional(context, Client.class);
+    //因为有具体的Url,所以就不需要负载均衡，所以除去LoadBalancerFeignClient实例
+    if (client != null) {
+        if (client instanceof LoadBalancerFeignClient) {
+            client = ((LoadBalancerFeignClient)client).getDelegate();
+        }
+        builder.client(client);
+    }
+    Targeter targeter = get(context, Targeter.class);
+    return targeter.target(this, builder, context, new HardCodedTarget〈〉(
+            this.type, this.name, url));
+}
+
+//这里就用到了FeignContext的getInstance方法，我们在前边已经讲解了FeignContext的作用，getOptional方法调用了FeignContext的getInstance方法，从FeignContext的对应名称的子上下文中获取到Client类型的Bean实例，其具体实现如下所示：
+//NamedContextFactory.java
+public 〈T〉 T getInstance(String name, Class〈T〉 type) {
+    AnnotationConfigApplicationContext context = getContext(name);
+    if (BeanFactoryUtils.beanNamesForTypeIncludingAncestors(context,
+            type).length 〉 0) {
+        //从对应的context中获取Bean实例,如果对应的子上下文没有则直接从父上下文中获取
+        return context.getBean(type);
+    }
+    return null;
+}
+
+//Targeter是一个接口，它的target方法会生成对应的实例对象。它有两个实现类，分别为DefaultTargeter和HystrixTargeter。OpenFeign使用HystrixTargeter这一层抽象来封装关于Hystrix的实现。DefaultTargeter的实现如下所示，只是调用了Feign.Builder的target方法：
+//DefaultTargeter.java
+class DefaultTargeter implements Targeter {
+@Override
+    public 〈T〉 T target(FeignClientFactoryBean factory, Feign.Builder feign, FeignContext context,
+                        Target.HardCodedTarget〈T〉 target) {
+        return feign.target(target);
+    }
+}
+
+//而Feign.Builder是由FeignClientFactoryBean对象的feign方法创建的。Feign.Builder会设置FeignLoggerFactory、EncoderDecoder和Contract等组件，这些组件的Bean实例都是通过FeignContext获取的，也就是说这些实例都是可配置的，你可以通过OpenFeign的配置机制为不同的FeignClient配置不同的组件实例。feign方法的实现如下所示：
+//FeignClientFactoryBean.java
+protected Feign.Builder feign(FeignContext context) {
+    FeignLoggerFactory loggerFactory = get(context, FeignLoggerFactory.class);
+    Logger logger = loggerFactory.create(this.type);
+    Feign.Builder builder = get(context, Feign.Builder.class)
+        .logger(logger)
+        .encoder(get(context, Encoder.class))
+        .decoder(get(context, Decoder.class))
+        .contract(get(context, Contract.class));
+    configureFeign(context, builder);
+    return builder;
+}
+//Feign.Builder负责生成被@FeignClient修饰的FeignClient接口类实例。它通过Java反射机制，构造InvocationHandler实例并将其注册到FeignClient上，当FeignClient的方法被调用时，InvocationHandler的回调函数会被调用，OpenFeign会在其回调函数中发送网络请求。build方法如下所示：
+//Feign.Builder
+public Feign build() {
+    SynchronousMethodHandler.Factory synchronousMethodHandlerFactory =
+        new SynchronousMethodHandler.Factory(client, retryer, requestInterceptors,
+        logger, logLevel, decode404);
+    ParseHandlersByName handlersByName = new ParseHandlersByName(contract, options, encoder, decoder, errorDecoder, synchronousMethodHandlerFactory);
+    return new ReflectiveFeign(handlersByName, invocationHandlerFactory);
+}
+
+//ReflectiveFeign的newInstance方法是生成FeignClient实例的关键实现。它主要做了两件事情，一是扫描FeignClient接口类的所有函数，生成对应的Handler；二是使用Proxy生成FeignClient的实例对象，代码如下所示：
+
+//ReflectiveFeign.java
+public 〈T〉 T newInstance(Target〈T〉 target) {
+    Map〈String, MethodHandler〉 nameToHandler = targetToHandlersByName.apply(target);
+    Map〈Method, MethodHandler〉 methodToHandler = new LinkedHashMap〈Method, MethodHandler〉();
+    List〈DefaultMethodHandler〉 defaultMethodHandlers = new LinkedList〈DefaultMethodHandler〉();
+    for (Method method : target.type().getMethods()) {
+        if (method.getDeclaringClass() == Object.class) {
+            continue;
+        } else if(Util.isDefault(method)) {
+            //为每个默认方法生成一个DefaultMethodHandler
+            defaultMethodHandler handler = new DefaultMethodHandler(method);
+            defaultMethodHandlers.add(handler);
+            methodToHandler.put(method, handler);
+        } else {
+            methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+        }
+    }
+    //生成java reflective的InvocationHandler
+    InvocationHandler handler = factory.create(target, methodToHandler);
+    T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(), new Class〈?〉[] {target.type()}, handler);
+    //将defaultMethodHandler绑定到proxy中
+    for(DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+        defaultMethodHandler.bindTo(proxy);
+    }
+    return proxy;
+}
+
+```
+
+1.扫描函数信息
+在扫描FeignClient接口类所有函数生成对应Handler的过程中，OpenFeign会生成调用该函数时发送网络请求的模板，也就是RequestTemplate实例。RequestTemplate中包含了发送网络请求的URL和函数参数填充的信息。@RequestMapping、@PathVariable等注解信息也会包含到RequestTemplate中，用于函数参数的填充。ParseHandlersByName类的apply方法就是这一过程的具体实现。它首先会使用Contract来解析接口类中的函数信息，并检查函数的合法性，然后根据函数的不同类型来为每个函数生成一个BuildTemplateByResolvingArgs对象，最后使用SynchronousMethodHandler.Factory来创建MethodHandler实例。ParseHandlersByName的apply实现如下代码所示：
+
+```java
+ParseHandlersByName.java
+public Map〈String, MethodHandler〉 apply(Target key) {
+    // 获取type的所有方法的信息,会根据注解生成每个方法的RequestTemplate
+    List〈MethodMetadata〉 metadata = contract.parseAndValidatateMetadata(key.type());
+    Map〈String, MethodHandler〉 result = new LinkedHashMap〈String, MethodHandler〉();
+    for (MethodMetadata md : metadata) {
+    BuildTemplateByResolvingArgs buildTemplate;
+    if (!md.formParams().isEmpty() &amp;&amp; md.template().bodyTemplate() == null) {
+        buildTemplate = new BuildFormEncodedTemplateFromArgs(md, encoder);
+    } else if (md.bodyIndex() != null) {
+        buildTemplate = new BuildEncodedTemplateFromArgs(md, encoder);
+    } else {
+        buildTemplate = new BuildTemplateByResolvingArgs(md);
+    }
+    result.put(md.configKey(),
+        factory.create(key, md, buildTemplate, options, decoder, errorDecoder));
+    }
+    return result;
+}
+```
+
+### 函数调用和网络请求
+
+在配置和实例生成结束之后，就可以直接使用FeignClient接口类的实例，调用它的函数来发送网络请求。在调用其函数的过程中，由于设置了MethodHandler，所以最终函数调用会执行SynchronousMethodHandler的invoke方法。在该方法中，OpenFeign会将函数的实际参数值与之前生成的RequestTemplate进行结合，然后发送网络请求。
+
+```java
+//SynchronousMethodHandler.java
+final class SynchronousMethodHandler implements MethodHandler {
+    public Object invoke(Object[] argv) throws Throwable {
+        //根据函数参数创建RequestTemplate实例，buildTemplateFromArgs是RequestTemplate.
+          Factory接口的实例，在当前状况下是
+        //BuildTemplateByResolvingArgs类的实例
+        RequestTemplate template = buildTemplateFromArgs.create(argv);
+        Retryer retryer = this.retryer.clone();
+        while (true) {
+            try {
+                return executeAndDecode(template);
+            } catch (RetryableException e) {
+                retryer.continueOrPropagate(e);
+                if (logLevel != Logger.Level.NONE) {
+                    logger.logRetry(metadata.configKey(), logLevel);
+                }
+                continue;
+            }
+        }
+    }
+}
+```
+
+executeAndDecode方法会根据RequestTemplate生成Request对象，然后交给Client实例发送网络请求，最后返回对应的函数返回类型的实例。executeAndDecode方法的具体实现如下所示：
+
+```java
+//SynchronousMethodHandler.java
+Object executeAndDecode(RequestTemplate template) throws Throwable {
+    //根据RequestTemplate生成Request
+    Request request = targetRequest(template);
+    Response response;
+    //client发送网络请求，client可能为okhttpclient和apacheClient
+    try {
+        response = client.execute(request, options);
+        response.toBuilder().request(request).build();
+    } catch (IOException e) {    } catch (IOException e) {
+        //...
+    }
+    try {
+        //如果response的类型就是函数返回类型，那么可以直接返回
+        if (Response.class == metadata.returnType()) {
+            if (response.body() == null) {
+                return response;
+            }
+            // 设置body
+            byte[] bodyData = Util.toByteArray(response.body().asInputStream());
+            return response.toBuilder().body(bodyData).build();
+          }
+        } catch (IOException e) {
+            //...
+    }
+}
+```
+
+Client是用来发送网络请求的接口类，有OkHttpClient和RibbonClient两个子类。OkhttpClient调用OkHttp的相关组件进行网络请求的发送。OkHttpClient的具体实现如下所示：
+
+```java
+/OkHttpClient.java
+public feign.Response execute(feign.Request input, feign.Request.Options options)
+        throws IOException {
+    //将feign.Request转换为Oktthp的Request对象
+       //将feign.Request转换为Oktthp的Request对象
+    Request request = toOkHttpRequest(input);
+    //使用Okhttp的同步操作发送网络请求
+    Response response = requestOkHttpClient.newCall(request).execute();
+    //将Okhttp的Response转换为feign.Response
+    return toFeignResponse(response).toBuilder().request(input).build();
+}
+```
+
+## 断路器Hystrix
+
+在分布式系统中，不同服务之间的调用非常常见，当服务提供者不可用时就很有可能发生服务雪崩效应，导致整个系统的不可用。所以为了预防这种情况的发生，可以使用断路器模式进行预防(类比电路中的断路器，在电路过大的时候自动断开，防止电线过热损害整条电路)。
+断路器将远程方法调用包装到一个断路器对象中，用于监控方法调用过程的失败。一旦该方法调用发生的失败次数在一段时间内达到一定的阀值，那么这个断路器将会跳闸，在接下来时间里再次调用该方法将会被断路器直接返回异常，而不再发生该方法的真实调用。这样就避免了服务调用者在服务提供者不可用时发送请求，从而减少线程池中资源的消耗，保护了服务调用者。图6-2为断路器时序图。
+如图6-2所示，虽然断路器在打开的时候避免了被保护方法的无效调用，但是当情况恢复正常时，需要外部干预来重置断路器，使得方法调用可以重新发生。所以合理的断路器应该具备一定的开关转化逻辑，它需要一个机制来控制它的重新闭合，图6-3展示了一个通过重置时间来决定断路器的重新闭合的逻辑。
+
+- 关闭状态：断路器处于关闭状态，统计调用失败次数，在一段时间内达到一定的阀值后断路器打开。
+- 打开状态：断路器处于打开状态，对方法调用直接返回失败错误，不发生真正的方法调用。设置了一个重置时间，在重置时间结束后，断路器来到半开状态。
+- 半开状态：断路器处于半开状态，此时允许进行方法调用，当调用都成功了(或者成功到达一定的比例)，关闭断路器，否则认为服务没有恢复，重新打开断路器。
+断路器的打开能保证服务调用者在调用异常服务时，快速返回结果，避免大量的同步等待，减少服务调用者的资源消耗。并且断路器能在打开一段时间后继续侦测请求执行结果，判断断路器是否能关闭，恢复服务的正常调用。
+
+### 服务降级操作
+
+在Hystrix中，当服务间调用发生问题时，它将采用备用的Fallback方法代替主方法执行并返回结果，对失败服务进行了服务降级。当调用服务失败次数在一段时间内超过了断路器的阀值时，断路器将打开，不再进行真正的方法调用，而是快速失败，直接执行Fallback逻辑，服务降级，减少服务调用者的资源消耗，保护服务调用者中的线程资源。
+
+### 资源隔离
+
+在货船中，为了防止漏水和火灾的扩散，一般会将货仓进行分割，避免了一个货仓出事导致整艘船沉没的悲剧。同样的，在Hystrix中，也采用了舱壁模式，将系统中的服务提供者隔离起来，一个服务提供者延迟升高或者失败，并不会导致整个系统的失败，同时也能够控制调用这些服务的并发度。
+1.线程与线程池
+Hystrix通过将调用服务线程与服务访问的执行线程分隔开来，调用线程能够空出来去做其他的工作而不至于因为服务调用的执行阻塞过长时间。
+在Hystrix中，将使用独立的线程池对应每一个服务提供者，用于隔离和限制这些服务。于是，某个服务提供者的高延迟或者饱和资源受限只会发生在该服务提供者对应的线程池中。
+如图6-5所示，Dependency D的调用失败或者高延迟仅会导致自身对应的线程池中的5个线程阻塞，并不会影响其他服务提供者的线程池。系统完全与服务提供者请求隔离开来，即使服务提供者对应的线程完全耗尽，并不会影响系统中的其他请求。注意在服务提供者的线程池被占满时，对该服务提供者的调用会被Hystrix直接进入回滚逻辑，快速失败，保护服务调用者的资源稳定。
+
+除了线程池外，Hystrix还可以通过信号量(计数器)来限制单个服务提供者的并发量。如果通过信号量来控制系统负载，将不再允许设置超时控制和异步化调用，这就表示在服务提供者出现高延迟时，其调用线程将会被阻塞，直至服务提供者的网络请求超时。如果对服务提供者的稳定性有足够的信心，可以通过信号量来控制系统的负载。
+
+### 设计思路
+
+结合上面的介绍，我们可以简单理解一下Hystrix的实现思路：
+·它将所有的远程调用逻辑封装到HystrixCommand或者HystrixObservableCommand对象中，这些远程调用将会在独立的线程中执行(资源隔离)，这里使用了设计模式中的命令模式。
+·Hystrix对访问耗时超过设置阀值的请求采用自动超时的策略。该策略对所有的命令都有效(如果资源隔离的方式为信号量，该特性将失效)，超时的阀值可以通过命令配置进行自定义。
+·为每一个服务提供者维护一个线程池(或者信号量)，当线程池被占满时，对于该服务提供者的请求将会被直接拒绝(快速失败)而不是排队等待，减少系统的资源等待。
+·针对请求服务提供者划分出成功、失效、超时和线程池被占满等四种可能出现的情况。
+·断路器机制将在请求服务提供者失败次数超过一定阀值后手动或者自动切断服务一段时间。
+·当请求服务提供者出现服务拒绝、超时和短路(多个服务提供者依次顺序请求，前面的服务提供者请求失败，后面的请求将不会发出)等情况时，执行其Fallback方法，服务降级。
+·提供接近实时的监控和配置变更服务。
+
+### 源码解析
+
+简单的流程如下：
+1)构建HystrixCommand或者HystrixObservableCommand对象。
+2)执行命令。
+3)检查是否有相同命令执行的缓存。
+4)检查断路器是否打开。
+5)检查线程池或者信号量是否被消耗完。
+6)调用HystrixObservableCommand#construct或HystrixCommand#run执行被封装的远程调用逻辑。
+7)计算链路的健康情况。
+8)在命令执行失败时获取Fallback逻辑。
+9)返回成功的Observable。
+接着我们通过源码来逐步理解这些过程。
+
+HystrixCommand可以继承 自定义 默认资源隔离10线程 10信号量 50失败熔断
+
+### 合并请求
+
+Hystrix还提供了请求合并的功能。多个请求被合并为一个请求进行一次性处理，可以有效减少网络通信和线程池资源。请求合并之后，一个请求原本可能在6毫秒之内能够结束，现在必须等待请求合并周期后(10毫秒)才能发送请求，增加了请求的时间(16毫秒)。但是请求合并在处理高并发和高延迟命令上效果极佳。
+
+它提供两种方式进行请求合并：request-scoped收集一个HystrixRequestContext中的请求集合成一个批次；而globally-scoped将多个HystrixRequestContext中的请求集合成一个批次，这需要应用的下游依赖能够支持在一个命令调用中处理多个HystrixRequestContext。
+HystrixRequestContext中包含和管理着HystrixRequestVariableDefault，HystrixRequestVariableDefault中提供了请求范围内的相关变量，所以在同一请求中的多个线程可以分享状态，HystrixRequestContext也可以通过HystrixRequestVariableDefault收集到请求范围内相同的HystrixCommand进行合并。
+
+.通过注解方式进行请求合并
+单个请求需要使用@HystrixCollapser注解修饰，并指明batchMethod方法，这里我们设置请求合并的周期为100秒。由于请求合并中不能同步等待结果，所以单个请求返回的结果为Future，即需要异步等待结果。
+batchMethod方法需要被@HystrixCommand注解，说明这是一个被HystrixCommand封装的方法，其内是一个批量的请求接口，为了方便展示，例中就直接虚假地构建了本地数据，同时有日志打印批量方法被执行。具体代码如下所示
+
+```java
+@HystrixCollapser(batchMethod = "getInstanceByServiceIds",
+    collapserProperties = {@HystrixProperty(name ="timerDelayInMilliseconds",value = "100")})
+public Future〈Instance〉 getInstanceByServiceId(String serviceId) {
+    return null;
+}
+@HystrixCommand
+public List〈Instance〉 getInstanceByServiceIds(List〈String〉 serviceIds){
+    List〈Instance〉 instances = new ArrayList〈〉();
+    logger.info("start batch!");
+    for(String s : serviceIds){
+        instances.add(new Instance(s, DEFAULT_HOST, DEFAULT_PORT));
+    }
+    return instances;
+}
+```
+
+2.继承HystrixCollapser
+请求合并命令同样也可以通过自定义的方式实现，只需继承HystrixCollapser抽象类，如下所示：
+
+```java
+public class CustomCollapseCommand extends HystrixCollapser〈List〈Instance〉, Instance, String〉{
+    public String serviceId;
+    public CustomCollapseCommand(String serviceId){
+        super(Setter.withCollapserKey(HystrixCollapserKey.Factory.asKey("customCollapseCommand")));
+        this.serviceId = serviceId;
+    }
+    @Override
+    public String getRequestArgument() {
+        return serviceId;
+    }
+    @Override
+    protected HystrixCommand〈List〈Instance〉〉 createCommand(Collection〈CollapsedRequest〈Instance, String〉〉 collapsedRequests) {
+        List〈String〉 ids = collapsedRequests.stream().map(CollapsedRequest::getArgument).collect(Collectors.toList());
+        return new InstanceBatchCommand(ids);
+    }
+    @Override
+    protected void mapResponseToRequests(List〈Instance〉 batchResponse, Collection〈CollapsedRequest〈Instance, String〉〉 collapsedRequests) {
+        int count = 0;
+        for( CollapsedRequest〈Instance, String〉 request : collapsedRequests){
+            request.setResponse(batchResponse.get(count++));
+        }
+    }
+    private static final class InstanceBatchCommand extends HystrixCommand〈List〈Instance〉〉{
+        private List〈String〉 serviceIds;
+        private static String DEFAULT_SERVICE_ID = "application";
+        private static String DEFAULT_HOST = "localhost";
+        private static int DEFAULT_PORT = 8080;
+        private static Logger logger = LoggerFactory.getLogger(InstanceBatchCommand.class);
+        protected InstanceBatchCommand(List〈String〉 serviceIds) {
+            super(HystrixCommandGroupKey.Factory.asKey("instanceBatchGroup"));
+            this.serviceIds = serviceIds;
+        }
+        @Override
+        protected List〈Instance〉 run() throws Exception {
+            List〈Instance〉 instances = new ArrayList〈〉();
+            logger.info("start batch!");
+            for(String s : serviceIds){
+                instances.add(new Instance(s, DEFAULT_HOST, DEFAULT_PORT));
+            }
+            return instances;
+        }
+    }
+}
+
+继承HystrixCollapser需要指定三个泛型，如下所示：
+public abstract class HystrixCollapser〈BatchReturnType, ResponseType, RequestArgumentType〉 implements HystrixExecutable〈ResponseType〉, HystrixObservable〈ResponseType〉 {...}
+
+BatchReturnType是批量操作的返回值类型，例子中为List〈Instance〉；ResponseType是单个操作的返回值类型，例子中是Instance；RequestArgumentType是单个操作的请求参数类型，例子中是String类型。
+在构造函数中需要指定CollapserKey，用来标记被合并请求的键值。CustomCollapseCommand同样可以通过Setter的方式修改默认配置。
+同时还需要实现三个方法，getRequestArgument方法获取被合并的单个请求的参数，createCommand方法用来生成进行批量请求的命令Command，mapResponseToRequests方法是将批量请求的结果与合并的请求进行匹配以返回对应的请求结果。
+
+```
+
+## Ribbon
+
+Ribbon是管理HTTP和TCP服务客户端的负载均衡器。Ribbon具有一系列带有名称的客户端(Named Client)，也就是带有名称的Ribbon客户端(Ribbon Client)。每个客户端由可配置的组件构成，负责一类服务的调用请求。Spring Cloud通过RibbonClientConfiguration为每个Ribbon客户端创建一个ApplicationContext上下文来进行组件装配。Ribbon作为Spring Cloud的负载均衡机制的实现，可以与OpenFeign和RestTemplate进行无缝对接，让二者具有负载均衡的能力。
+
+当系统面临大量的用户访问，负载过高的时候，通常会增加服务器数量来进行横向扩展，多个服务器的负载需要均衡，以免出现服务器负载不均衡，部分服务器负载较大，部分服务器负载较小的情况。通过负载均衡，使得集群中服务器的负载保持在稳定高效的状态，从而提高整个系统的处理能力。
+系统的负载均衡分为软件负载均衡和硬件负载均衡。软件负载均衡使用独立的负载均衡程序或系统自带的负载均衡模块完成对请求的分配派发。硬件负载均衡通过特殊的硬件设备进行负载均衡的调配。
+而软负载均衡一般分为两种类型，基于DNS的负载均衡和基于IP的负载均衡。利用DNS实现负载均衡，就是在DNS服务器配置多个A记录，不同的DNS请求会解析到不同的IP地址。大型网站一般使用DNS作为第一级负载均衡。基于IP的负载均衡根据请求的IP进行负载均衡。LVS就是具有代表性的基于IP的负载均衡实现。
+但是目前来说，大家最为熟悉的，最为主流的负载均衡技术还是反向代理负载均衡。所有主流的Web服务器都热衷于支持基于反向代理的负载均衡。它的核心工作是代理根据一定规则，将HTTP请求转发到服务器集群的单一服务器上。
+Ribbon使用的是客户端负载均衡。客户端负载均衡和服务端负载均衡最大的区别在于服务端地址列表的存储位置，在客户端负载均衡中，所有的客户端节点都有一份自己要访问的服务端地址列表，这些列表统统都是从服务注册中心获取的；而在服务端负载均衡中，客户端节点只知道单一服务代理的地址，服务代理则知道所有服务端的地址。在Spring Cloud中我们如果想要使用客户端负载均衡，方法很简单，使用@LoadBalanced注解即可，这样客户端在发起请求的时候会根据负载均衡策略从服务端列表中选择一个服务端，向该服务端发起网络请求，从而实现负载均衡。
+
+### 配置和实例初始化
+
+1111
+
+### 与openfeign的集成
+
+Ribbon是RESTful HTTP客户端OpenFeign负载均衡的默认实现。本书在OpenFeign的章节中讲解了相关实例的初始化过程。FeignClientFactoryBean是创造FeignClient的工厂类，在其getObject方法中有一个分支判断，当请求URL不为空时，就会生成一个具有负载均衡的FeignClient。在这个过程中，OpenFeign就默认引入了Ribbon的负载均衡实现，OpenFegin引入Ribbon的部分代码如下所示：
+
+```java
+//FeignClientFactoryBean.java
+public Object getObject() throws Exception {
+    FeignContext context = applicationContext.getBean(FeignContext.class);
+    Feign.Builder builder = feign(context);
+    //如果url不为空，则需要负载均衡
+    if (!StringUtils.hasText(this.url)) {
+        String url;
+        if (!this.name.startsWith("http")) {
+            url = "http://" + this.name;
+        }
+        else {
+            url = this.name;
+        }
+        url += cleanPath();
+        return loadBalance(builder, context, new HardCodedTarget〈〉(this.type,
+                this.name, url));
+    }
+    //....生成普通的FeignClient
+}
+```
+
+如OpenFeign的源码所示，loadBalance方法会生成LoadBalancerFeignClient实例进行返回。LoadBalancerFeignClient实现了OpenFeign的Client接口，负责OpenFeign网络请求的发送和响应的接收，并带有客户端负载均衡机制。loadBalance方法实现如下所示：
+
+```java
+/FeignClientFactoryBean.java
+protected 〈T〉 T loadBalance(Feign.Builder builder, FeignContext context,
+        HardCodedTarget〈T〉 target) {
+    //会得到'LoadBalancerFeignClient'
+    Client client = getOptional(context, Client.class);
+    if (client != null) {
+        builder.client(client);
+        Targeter targeter = get(context, Targeter.class);
+        return targeter.target(this, builder, context, target);
+    }
+}
+
+```
+
+LoadBalancerFeignClient#execute方法会将普通的Request对象转化为RibbonRequest，并使用FeignLoadBalancer实例来发送RibbonRequest。execute方法会首先将Request的URL转化为对应的服务名称，然后构造出RibbonRequest对象，接着调用lbClient方法来生成FeignLoadBalancer实例，最后调用FeignLoadBalancer实例的executeWithLoadBalancer方法来处理网络请求。LoadBalancerFeignClient#execute方法的具体实现如下所示：
+
+```java
+//LoadBalancerFeignClient.java
+public Response execute(Request request, Request.Options options) throws IOException {
+    try {
+        //负载均衡时，host就是需要调用的服务的名称
+        URI asUri = URI.create(request.url());
+        String clientName = asUri.getHost();
+        URI uriWithoutHost = cleanUrl(request.url(), clientName);
+        //构造RibbonRequest,delegate一般就是真正发送网络请求的客户端，比如说OkHttpClient和ApacheClient
+        FeignLoadBalancer.RibbonRequest ribbonRequest = new FeignLoadBalancer.RibbonRequest(
+                this.delegate, request, uriWithoutHost);
+        IClientConfig requestConfig = getClientConfig(options, clientName);
+        //executeWithLoadBalancer是进行负载均衡的关键
+        return lbClient(clientName).executeWithLoadBalancer(ribbonRequest,
+                requestConfig).toResponse();
+    }
+    catch (ClientException e) {
+        IOException io = findIOException(e);
+        if (io != null) {
+            throw io;
+        }
+        throw new RuntimeException(e);
+    }
+}
+private FeignLoadBalancer lbClient(String clientName) {
+    //调用CachingSpringLoadBalancerFactory类的create方法。
+    return this.lbClientFactory.create(clientName);
+}
+```
+
+ILoadBalancer是Ribbon的关键类之一，它是定义负载均衡操作过程的接口。Ribbon通过SpringClientFactory工厂类的getLoadBalancer方法可以获取ILoadBalancer实例。根据Ribbon的组件实例化机制，ILoadBalnacer实例是在RibbonAutoConfiguration中被创建生成的。
+SpringClientFactory中的实例都是RibbonClientConfiguration或者自定义Configuration配置类创建的Bean实例。RibbonClientConfiguration还创建了IRule、IPing和ServerList等相关组件的实例。使用者可以通过自定义配置类给出上述几个组件的不同实例。
+
+IRule是定义Ribbon负载均衡策略的接口，你可以通过实现该接口来自定义自己的负载均衡策略，RibbonClientConfiguration配置类则会给出IRule的默认实例。IRule接口的choose方法就是从一堆服务器中根据一定规则选出一个服务器。IRule有很多默认的实现类，这些实现类根据不同的算法和逻辑来进行负载均衡。
+
+只读数据库的负载均衡实现
+
+你需要定义DBServer类来继承Ribbon的Server类，用于存储只读数据库服务器的状态信息，比如说IP地址、数据库连接数、平均请求响应时间等，然后定义一个DBLoadBalancer来继承BaseLoadBalancer类。下述示例代码通过WeightedResponseTimeRule对DBServer列表进行负载均衡选择，然后使用自定义的DBPing来检测数据库是否可用。示例代码如下所示：
+
+```java
+public DBLoadBalancer buildFixedDBServerListLoadBalancer(List〈DBServer〉 servers) {
+        IRule rule = new WeightedResponseTimeRule();
+        IPing ping = new DBPing();
+        DBLoadBalancer lb = new DBLoadBalancer(config, rule, ping);
+        lb.setServersList(servers);
+        return lb;
+}
 
 
+public class DBConnectionLoadBalancer {
+    private final ILoadBalancer loadBalancer;
+    private final RetryHandler retryHandler = new DefaultLoadBalancerRetryHandler (0, 1, true);
+    public DBConnectionLoadBalancer(List〈DBServer〉 serverList) {
+        loadBalancer = LoadBalancerBuilder.newBuilder().buildFixedDBServerListLoadBalancer(serverList);
+    }
+    public String executeSQL(final String sql) throws Exception {
+        //使用LoadBalancerCommand来进行负载均衡，具体策略可以在Builder中进行设置
+        return LoadBalancerCommand.〈String〉builder()
+            .withLoadBalancer(loadBalancer)
+            .build()
+            .submit(new ServerOperation〈String〉() {
+                @Override
+                public Observable〈String〉 call(Server server) {
+                    URL url;
+                    try {
+                        return Observable.just(DBManager.execute(server, sql));
+                    } catch (Exception e) {
+                        return Observable.error(e);
+                    }
+                }
+            }).toBlocking().first();
+    }
+}
+
+```
 
 
